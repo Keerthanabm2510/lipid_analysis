@@ -49,18 +49,20 @@ raw <- raw %>%
     LipidClass = str_extract(LipidName, "^[A-Za-z]+") # e.g. PC, SPH, TG
   )
  
-# annotate_lipids() returns a data frame — check its actual column names first
+# annotate_lipids() only returns rows for successfully parsed lipids
+# so we must join by name, not bind by position
 parsed <- annotate_lipids(raw$LipidName)
 cat("Columns returned by annotate_lipids():\n")
 print(colnames(parsed))
  
-# The first column is the input lipid name (may be called 'name' or 'query'
-# depending on lipidr version). Drop it safely by position instead of by name.
-parsed_clean <- parsed[ , -1, drop = FALSE]
+# Rename the first column to "LipidName" so we can left_join safely
+colnames(parsed)[1] <- "LipidName"
  
-# Merge parsed annotations back (column-bind; rows are in the same order)
-data <- bind_cols(raw, parsed_clean)
+# Left join: all 127 rows kept; unmatched rows get NA in annotation columns
+data <- raw %>%
+  left_join(parsed, by = "LipidName")
  
+cat(sprintf("\nRows after join: %d (should match raw: %d)\n", nrow(data), nrow(raw)))
 cat("\nLipid classes found:\n")
 print(table(data$LipidClass))
  
