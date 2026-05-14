@@ -1,0 +1,344 @@
+# ============================================================
+#  lipidr Analysis Pipeline — Preeti Lipids Dataset
+#  Requires: lipidr, ComplexHeatmap, ggraph, igraph, tidyverse
+# ============================================================
+ 
+# ── 1. Install & load packages ───────────────────────────────
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+ 
+BiocManager::install(c("lipidr", "ComplexHeatmap"), ask = FALSE)
+install.packages(c("tidyverse", "igraph", "ggraph", "readr",
+                   "RColorBrewer", "circlize", "ggrepel"), 
+                 dependencies = TRUE)
+ 
+library(lipidr)
+library(tidyverse)
+library(ComplexHeatmap)
+library(igraph)
+library(ggraph)
+library(RColorBrewer)
+library(circlize)
+library(ggrepel)
+ 
+ 
+# ── 2. Load & inspect raw data ───────────────────────────────
+# Your file is tab-separated despite the .xls extension
+raw <- read_tsv("Preeti_Lipids__1_.xls", show_col_types = FALSE)
+ 
+glimpse(raw)
+# Key columns:
+#   LipidID       — full lipid name with adduct
+#   LipidGroupKey — grouped lipid name
+#   Intensity     — peak intensity
+#   Area          — peak area
+#   TopRT         — retention time (minutes)
+#   IDScore       — identification confidence score
+#   Grade         — quality grade (e.g. C)
+#   Adduct        — ionisation adduct (M+H, M+Na, etc.)
+#   S/N           — signal-to-noise ratio
+#   ObsMz / CalcMz — observed and calculated m/z
+ 
+ 
+# ── 3. Parse lipid names with lipidr ─────────────────────────
+# lipidr uses rgoslin under the hood to parse lipid nomenclature
+# Extract the clean lipid name (strip the adduct suffix first)
+raw <- raw %>%
+  mutate(
+    LipidName = str_remove(LipidGroupKey, "\\+.*$"),   # strip +H, +Na etc.
+    LipidName = str_remove(LipidName,    "-.*$"),       # strip -H etc.
+    LipidClass = str_extract(LipidName, "^[A-Za-z]+")  # e.g. PC, SPH, TG
+  )
+ 
+# Parse using lipidr's name annotation
+parsed <- annotate_lipids(raw$LipidName)
+# Adds columns: Class, Category, total_cl, total_cs (chain length / saturation)
+ 
+# Merge parsed annotations back
+data <- bind_cols(raw, parsed %>% select(-name))
+ 
+cat("Lipid classes found:\n")
+print(table(data$LipidClass))
+ 
+ 
+# ── 4. Build a SummarizedExperiment for lipidr ───────────────
+# lipidr expects: rows = lipid species, columns = samples
+# Since this dataset has one sample with multiple detections,
+# we aggregate replicates by LipidGroupKey
+ 
+assay_mat <- data %>%
+  group_by(LipidGroupKey) %>%
+  summarise(
+    MeanIntensity = mean(Intensity, na.rm = TRUE),
+    MeanArea      = mean(Area,      na.rm = TRUE),
+    MeanIDScore   = mean(IDScore,   na.rm = TRUE),
+    MeanRT        = mean(TopRT,     na.rm = TRUE),
+    MeanSNR       = mean(`S/N`,     na.rm = TRUE),
+    Count         = n(),
+    LipidClass    = first(LipidClass),
+    .groups = "drop"
+  )
+ 
+cat(sprintf("\n%d unique lipid species after aggregation\n", nrow(assay_mat)))
+ 
+ 
+# ── 5. Quality filtering ─────────────────────────────────────
+# Keep lipids with IDScore > 0 and S/N > 1
+filtered <- assay_mat %>%
+  filter(MeanIDScore > 0, MeanSNR > 1)
+ 
+cat(sprintf("%d lipids pass QC filter (IDScore > 0, S/N > 1)\n", nrow(filtered)))
+ 
+ 
+# ── 6. Log-transform intensities ─────────────────────────────
+filtered <- filtered %>%
+  mutate(
+    log2Intensity = log2(MeanIntensity + 1),
+    log2Area      = log2(MeanArea + 1)
+  )
+ 
+ 
+# ── 7. Lipid class summary ───────────────────────────────────
+class_summary <- filtered %>%
+  group_by(LipidClass) %>%
+  summarise(
+    n_species       = n(),
+    median_intensity = median(MeanIntensity),
+    median_area      = median(MeanArea),
+    median_IDScore   = median(MeanIDScore),
+    median_RT        = median(MeanRT),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(median_intensity))
+ 
+print(class_summary)
+ 
+ 
+# ── 8. Heatmap of lipid class × metric ───────────────────────
+# Build a matrix: rows = lipid classes, columns = metrics (z-scored)
+hm_mat <- class_summary %>%
+  column_to_rownames("LipidClass") %>%
+  select(n_species, median_intensity, median_area,
+         median_IDScore, median_RT) %>%
+  as.matrix()
+ 
+# Z-score each column across classes
+hm_scaled <- scale(hm_mat)
+ 
+col_fun <- colorRamp2(
+  c(-2, 0, 2),
+  c("#185FA5", "white", "#993C1D")   # blue → white → coral
+)
+ 
+png("heatmap_lipid_classes.png", width = 900, height = 700, res = 120)
+Heatmap(
+  hm_scaled,
+  name            = "z-score",
+  col             = col_fun,
+  row_names_gp    = gpar(fontsize = 11),
+  column_names_gp = gpar(fontsize = 11),
+  column_names_rot = 30,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(sprintf("%.2f", hm_scaled[i, j]),
+              x, y, gp = gpar(fontsize = 9))
+  },
+  column_title    = "Lipid class profile heatmap (z-scored)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold"),
+  heatmap_legend_param = list(title = "z-score", direction = "horizontal")
+)
+dev.off()
+cat("Saved: heatmap_lipid_classes.png\n")
+ 
+ 
+# ── 9. Per-species heatmap (top 30 by intensity) ─────────────
+top30 <- filtered %>%
+  slice_max(order_by = MeanIntensity, n = 30)
+ 
+sp_mat <- top30 %>%
+  select(log2Intensity, log2Area, MeanIDScore, MeanRT, MeanSNR) %>%
+  as.matrix()
+rownames(sp_mat) <- top30$LipidGroupKey
+ 
+sp_scaled <- scale(sp_mat)
+ 
+# Annotation bar: lipid class
+class_colors <- setNames(
+  colorRampPalette(brewer.pal(11, "Set3"))(length(unique(top30$LipidClass))),
+  unique(top30$LipidClass)
+)
+row_ann <- rowAnnotation(
+  Class = top30$LipidClass,
+  col   = list(Class = class_colors),
+  annotation_name_gp = gpar(fontsize = 10)
+)
+ 
+png("heatmap_top30_species.png", width = 1000, height = 900, res = 120)
+Heatmap(
+  sp_scaled,
+  name            = "z-score",
+  col             = col_fun,
+  left_annotation = row_ann,
+  row_names_gp    = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 10),
+  column_names_rot = 30,
+  column_title    = "Top 30 lipid species (z-scored metrics)",
+  column_title_gp = gpar(fontsize = 13, fontface = "bold"),
+  row_dend_side   = "right",
+  clustering_distance_rows = "euclidean",
+  clustering_method_rows   = "ward.D2"
+)
+dev.off()
+cat("Saved: heatmap_top30_species.png\n")
+ 
+ 
+# ── 10. Network: co-elution network (shared RT window) ───────
+# Connect lipid species whose retention times are within 1.5 min
+rt_threshold <- 1.5
+ 
+# Build edge list
+nodes <- filtered %>%
+  select(LipidGroupKey, LipidClass, log2Intensity, MeanRT, MeanIDScore)
+ 
+n <- nrow(nodes)
+edges <- data.frame()
+ 
+for (i in 1:(n - 1)) {
+  for (j in (i + 1):n) {
+    rt_diff <- abs(nodes$MeanRT[i] - nodes$MeanRT[j])
+    if (rt_diff <= rt_threshold) {
+      edges <- rbind(edges, data.frame(
+        from   = nodes$LipidGroupKey[i],
+        to     = nodes$LipidGroupKey[j],
+        weight = 1 - (rt_diff / rt_threshold)   # closer RT → stronger edge
+      ))
+    }
+  }
+}
+ 
+cat(sprintf("Network: %d nodes, %d edges\n", n, nrow(edges)))
+ 
+g <- graph_from_data_frame(
+  d        = edges,
+  vertices = nodes %>% rename(name = LipidGroupKey),
+  directed = FALSE
+)
+ 
+# Node attributes
+V(g)$size      <- rescale(V(g)$log2Intensity, to = c(3, 14))
+V(g)$color_cls <- V(g)$LipidClass
+ 
+png("network_coelution.png", width = 1200, height = 1000, res = 120)
+set.seed(42)
+ggraph(g, layout = "fr") +                          # Fruchterman-Reingold
+  geom_edge_link(aes(alpha = weight), color = "gray70", width = 0.4) +
+  geom_node_point(aes(size = log2Intensity, color = LipidClass)) +
+  geom_node_text(
+    aes(label = ifelse(log2Intensity > quantile(log2Intensity, 0.75),
+                       name, "")),
+    size = 2.8, repel = TRUE, max.overlaps = 20
+  ) +
+  scale_size_continuous(range = c(2, 10), name = "log2 Intensity") +
+  scale_color_brewer(palette = "Set3", name = "Lipid class") +
+  scale_edge_alpha(range = c(0.1, 0.6), guide = "none") +
+  labs(
+    title    = "Lipid co-elution network",
+    subtitle = paste0("Edges: RT difference ≤ ", rt_threshold, " min | ",
+                      "Node size: log2 intensity")
+  ) +
+  theme_graph(base_family = "sans") +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40"),
+    legend.position = "right"
+  )
+dev.off()
+cat("Saved: network_coelution.png\n")
+ 
+ 
+# ── 11. Network: lipid class connectivity ────────────────────
+# Aggregate to class level and connect classes that share co-eluting species
+class_edges <- edges %>%
+  left_join(nodes %>% select(LipidGroupKey, LipidClass),
+            by = c("from" = "LipidGroupKey")) %>%
+  rename(class_from = LipidClass) %>%
+  left_join(nodes %>% select(LipidGroupKey, LipidClass),
+            by = c("to"   = "LipidGroupKey")) %>%
+  rename(class_to = LipidClass) %>%
+  filter(class_from != class_to) %>%
+  group_by(class_from, class_to) %>%
+  summarise(n_connections = n(), .groups = "drop")
+ 
+class_nodes <- class_summary %>%
+  select(LipidClass, n_species, median_intensity)
+ 
+g_class <- graph_from_data_frame(
+  d        = class_edges %>% rename(from = class_from, to = class_to),
+  vertices = class_nodes %>% rename(name = LipidClass),
+  directed = FALSE
+)
+ 
+png("network_lipid_classes.png", width = 900, height = 800, res = 120)
+set.seed(7)
+ggraph(g_class, layout = "circle") +
+  geom_edge_link(aes(width = n_connections, alpha = n_connections),
+                 color = "#534AB7") +
+  geom_node_point(aes(size = n_species, color = name)) +
+  geom_node_label(aes(label = name), repel = TRUE,
+                  size = 3.5, fontface = "bold",
+                  label.padding = unit(0.2, "lines")) +
+  scale_size_continuous(range = c(5, 18), name = "# species") +
+  scale_edge_width_continuous(range = c(0.5, 4), name = "# co-elutions") +
+  scale_edge_alpha_continuous(range = c(0.2, 0.8), guide = "none") +
+  scale_color_brewer(palette = "Set3", guide = "none") +
+  labs(
+    title    = "Lipid class co-elution network",
+    subtitle = "Edge width = number of co-eluting species pairs between classes"
+  ) +
+  theme_graph(base_family = "sans") +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray40")
+  )
+dev.off()
+cat("Saved: network_lipid_classes.png\n")
+ 
+ 
+# ── 12. Bubble / scatter plot (RT vs Intensity) ──────────────
+png("bubble_rt_intensity.png", width = 1000, height = 700, res = 120)
+ggplot(filtered, aes(x = MeanRT, y = log2Intensity,
+                     size = Count, color = LipidClass)) +
+  geom_point(alpha = 0.75) +
+  geom_text_repel(
+    data = filtered %>% slice_max(log2Intensity, n = 15),
+    aes(label = LipidGroupKey),
+    size = 2.8, max.overlaps = 15, box.padding = 0.4
+  ) +
+  scale_size_continuous(range = c(3, 12), name = "Detection count") +
+  scale_color_brewer(palette = "Set3", name = "Lipid class") +
+  labs(
+    x        = "Mean retention time (min)",
+    y        = "log2 mean intensity",
+    title    = "Lipid species: retention time vs intensity",
+    subtitle = "Bubble size = detection count; top 15 labelled"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+dev.off()
+cat("Saved: bubble_rt_intensity.png\n")
+ 
+ 
+# ── 13. Export cleaned data ───────────────────────────────────
+write_csv(filtered,       "lipids_filtered_aggregated.csv")
+write_csv(class_summary,  "lipid_class_summary.csv")
+ 
+cat("\n✓ Analysis complete. Files saved:\n")
+cat("  heatmap_lipid_classes.png\n")
+cat("  heatmap_top30_species.png\n")
+cat("  network_coelution.png\n")
+cat("  network_lipid_classes.png\n")
+cat("  bubble_rt_intensity.png\n")
+cat("  lipids_filtered_aggregated.csv\n")
+cat("  lipid_class_summary.csv\n")
