@@ -1,5 +1,5 @@
 # ============================================================
-#  lipidr Analysis Pipeline — Lipids Dataset
+#  lipidr Analysis Pipeline — Preeti Lipids Dataset
 #  Requires: lipidr, ComplexHeatmap, ggraph, igraph, tidyverse
 # ============================================================
  
@@ -41,23 +41,27 @@ glimpse(raw)
  
  
 # ── 3. Parse lipid names with lipidr ─────────────────────────
-# lipidr uses rgoslin under the hood to parse lipid nomenclature
-# Extract the clean lipid name (strip the adduct suffix first)
+# Strip adduct suffixes to get clean lipid names for parsing
 raw <- raw %>%
   mutate(
-    LipidName = str_remove(LipidGroupKey, "\\+.*$"),   # strip +H, +Na etc.
-    LipidName = str_remove(LipidName,    "-.*$"),       # strip -H etc.
-    LipidClass = str_extract(LipidName, "^[A-Za-z]+")  # e.g. PC, SPH, TG
+    LipidName  = str_remove(LipidGroupKey, "\\+.*$"),  # strip +H, +Na etc.
+    LipidName  = str_remove(LipidName,     "-.*$"),    # strip -H etc.
+    LipidClass = str_extract(LipidName, "^[A-Za-z]+") # e.g. PC, SPH, TG
   )
  
-# Parse using lipidr's name annotation
+# annotate_lipids() returns a data frame — check its actual column names first
 parsed <- annotate_lipids(raw$LipidName)
-# Adds columns: Class, Category, total_cl, total_cs (chain length / saturation)
+cat("Columns returned by annotate_lipids():\n")
+print(colnames(parsed))
  
-# Merge parsed annotations back
-data <- bind_cols(raw, parsed %>% select(-name))
+# The first column is the input lipid name (may be called 'name' or 'query'
+# depending on lipidr version). Drop it safely by position instead of by name.
+parsed_clean <- parsed[ , -1, drop = FALSE]
  
-cat("Lipid classes found:\n")
+# Merge parsed annotations back (column-bind; rows are in the same order)
+data <- bind_cols(raw, parsed_clean)
+ 
+cat("\nLipid classes found:\n")
 print(table(data$LipidClass))
  
  
