@@ -229,8 +229,12 @@ g <- graph_from_data_frame(
   directed = FALSE
 )
  
-# Node attributes
-V(g)$size      <- rescale(V(g)$log2Intensity, to = c(3, 14))
+# Node attributes — base R rescaling (avoids dependency on scales::rescale)
+rescale_range <- function(x, new_min = 3, new_max = 14) {
+  new_min + (x - min(x, na.rm = TRUE)) /
+    (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)) * (new_max - new_min)
+}
+V(g)$size      <- rescale_range(V(g)$log2Intensity)
 V(g)$color_cls <- V(g)$LipidClass
  
 png("network_coelution.png", width = 1200, height = 1000, res = 120)
