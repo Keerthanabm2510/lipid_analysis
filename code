@@ -1,354 +1,1046 @@
-# ============================================================
-#  lipidr Analysis Pipeline — Lipids Dataset
-#  Requires: lipidr, ComplexHeatmap, ggraph, igraph, tidyverse
-# ============================================================
- 
-# ── 1. Install & load packages ───────────────────────────────
-if (!requireNamespace("BiocManager", quietly = TRUE))
-  install.packages("BiocManager")
- 
-BiocManager::install(c("lipidr", "ComplexHeatmap"), ask = FALSE)
-install.packages(c("tidyverse", "igraph", "ggraph", "readr",
-                   "RColorBrewer", "circlize", "ggrepel"), 
-                 dependencies = TRUE)
- 
+# =============================================================================
+# HEATMAP FOR 2-SAMPLE LIPIDOMICS (T1 vs T2)
+# =============================================================================
+# WHY the previous heatmap was plain/uninformative:
+#   - Z-score with only 2 samples always gives exactly +0.707 / -0.707
+#     for every single lipid → all tiles become the same dark red / dark blue
+#   - The lipid class colour bar wasn't rendering because annotation_colors
+#     key name must exactly match the annotation data.frame column name
+#
+# SOLUTION:
+#   1. Use log2(area) directly — shows real abundance differences between lipids
+#   2. Keep only lipids detected in BOTH time points (no zeros) for heatmap
+#      to avoid extreme fold changes from absence/presence patterns
+#   3. Sort rows by lipid class so the class colour bar is visually meaningful
+#   4. Add a second FC heatmap showing all lipids including unique ones
+# =============================================================================
+
 library(lipidr)
-library(tidyverse)
-library(ComplexHeatmap)
-library(igraph)
-library(ggraph)
+library(SummarizedExperiment)
+library(readODS)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
 library(RColorBrewer)
-library(circlize)
+library(ggplot2)
 library(ggrepel)
- 
- 
-# ── 2. Load & inspect raw data ───────────────────────────────
-# Your file is tab-separated despite the .xls extension
-raw <- read_tsv("Lipids.xls", show_col_types = FALSE)
- 
-glimpse(raw)
-# Key columns:
-#   LipidID       — full lipid name with adduct
-#   LipidGroupKey — grouped lipid name
-#   Intensity     — peak intensity
-#   Area          — peak area
-#   TopRT         — retention time (minutes)
-#   IDScore       — identification confidence score
-#   Grade         — quality grade (e.g. C)
-#   Adduct        — ionisation adduct (M+H, M+Na, etc.)
-#   S/N           — signal-to-noise ratio
-#   ObsMz / CalcMz — observed and calculated m/z
- 
- 
-# ── 3. Parse lipid names with lipidr ─────────────────────────
-# Strip adduct suffixes to get clean lipid names for parsing
-raw <- raw %>%
-  mutate(
-    LipidName  = str_remove(LipidGroupKey, "\\+.*$"),  # strip +H, +Na etc.
-    LipidName  = str_remove(LipidName,     "-.*$"),    # strip -H etc.
-    LipidClass = str_extract(LipidName, "^[A-Za-z]+") # e.g. PC, SPH, TG
-  )
- 
-# annotate_lipids() only returns rows for successfully parsed lipids
-# so we must join by name, not bind by position
-parsed <- annotate_lipids(raw$LipidName)
-cat("Columns returned by annotate_lipids():\n")
-print(colnames(parsed))
- 
-# Rename the first column to "LipidName" so we can left_join safely
-colnames(parsed)[1] <- "LipidName"
- 
-# Left join: all 127 rows kept; unmatched rows get NA in annotation columns
-data <- raw %>%
-  left_join(parsed, by = "LipidName")
- 
-cat(sprintf("\nRows after join: %d (should match raw: %d)\n", nrow(data), nrow(raw)))
-cat("\nLipid classes found:\n")
-print(table(data$LipidClass))
- 
- 
-# ── 4. Build a SummarizedExperiment for lipidr ───────────────
-# lipidr expects: rows = lipid species, columns = samples
-# Since this dataset has one sample with multiple detections,
-# we aggregate replicates by LipidGroupKey
- 
-assay_mat <- data %>%
-  group_by(LipidGroupKey) %>%
+
+# --------------------------------------------------------------------------
+# 1. LOAD & PREPARE DATA (same as before)
+# --------------------------------------------------------------------------
+file_path <- "/home/mahe/lipidomics/lipidomics_data.ods"
+
+s1 <- read_ods(file_path, sheet = "1 sample")
+s2 <- read_ods(file_path, sheet = "2 sample")
+colnames(s1) <- c("Lipid", "intensity_T1", "area_T1")
+colnames(s2) <- c("Lipid", "intensity_T2", "area_T2")
+
+clean_lipid_name <- function(x) {
+  x <- sub("\\+H$", "", x);  x <- sub("\\+Na$", "", x)
+  x <- sub("-H$", "", x);    x <- sub("\\+NH4$", "", x)
+  x <- sub("\\+HCOO$", "", x); x <- sub("\\+CHO.*$", "", x)
+  x <- sub("\\+COOCH3.*$", "", x); x <- sub(":\\(s\\)$", "", x)
+  trimws(x)
+}
+s1$Lipid <- clean_lipid_name(s1$Lipid)
+s2$Lipid <- clean_lipid_name(s2$Lipid)
+
+# Full join — all lipids across both time points
+data_wide <- full_join(
+  s1 %>% select(Lipid, T1 = area_T1),
+  s2 %>% select(Lipid, T2 = area_T2),
+  by = "Lipid"
+) %>%
+  group_by(Lipid) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+data_wide[is.na(data_wide)] <- 0
+
+# Extract class from lipid name
+data_wide <- data_wide %>%
+    mutate(Class = stringr::str_extract(Lipid, "^[A-Za-z]+"))
+
+# log2 transform
+data_wide <- data_wide %>%
+  mutate(log2_T1 = log2(T1 + 1),
+         log2_T2 = log2(T2 + 1),
+         log2FC  = log2_T2 - log2_T1,
+         detected_in = case_when(
+           T1 > 0 & T2 > 0 ~ "Both",
+           T1 > 0 & T2 == 0 ~ "T1 only",
+           T1 == 0 & T2 > 0 ~ "T2 only",
+           TRUE ~ "Neither"
+         ))
+
+cat("Detection summary:\n")
+print(table(data_wide$detected_in))
+
+# --------------------------------------------------------------------------
+# 2. HEATMAP A — Log2 Abundance (all detected lipids, sorted by class)
+# --------------------------------------------------------------------------
+# Using log2(area) directly — NOT z-score — so colour reflects real abundance
+# This shows which lipids are high/low and how they differ between T1 and T2
+
+hm_all <- data_wide %>%
+  filter(detected_in %in% c("Both", "T1 only", "T2 only")) %>%
+  arrange(Class, desc(log2_T1 + log2_T2))   # sort by class then by total signal
+
+mat_log2 <- as.matrix(hm_all[, c("log2_T1", "log2_T2")])
+rownames(mat_log2) <- hm_all$Lipid
+colnames(mat_log2) <- c("T1", "T2")
+
+# Annotation: lipid class (column name MUST match annotation_colors key exactly)
+annot_row <- data.frame(
+  Class = hm_all$Class,
+  Detected = hm_all$detected_in,
+  row.names = hm_all$Lipid
+)
+
+# Define class colours
+classes <- sort(unique(hm_all$Class))
+n_cls   <- length(classes)
+cls_pal <- setNames(
+  colorRampPalette(c(
+    "#E41A1C","#377EB8","#4DAF4A","#984EA3","#FF7F00",
+    "#A65628","#F781BF","#999999","#66C2A5","#FC8D62",
+    "#8DA0CB","#E78AC3","#A6D854","#FFD92F","#B3B3B3",
+    "#1B9E77","#D95F02","#7570B3","#E7298A","#66A61E"
+  ))(n_cls),
+  classes
+)
+
+det_colors <- c("Both" = "#2ca25f", "T1 only" = "#2b8cbe",
+                "T2 only" = "#d7301f", "Neither" = "grey90")
+
+annot_colors <- list(
+  Class    = cls_pal,
+  Detected = det_colors
+)
+
+# Column annotation
+annot_col <- data.frame(
+  TimePoint = c("T1", "T2"),
+  row.names = c("T1", "T2")
+)
+
+png("heatmap_log2_abundance.png", width = 2000, height = 3200, res = 220)
+pheatmap(
+  mat_log2,
+  color             = colorRampPalette(c("#f7fbff","#c6dbef","#6baed6","#2171b5","#08306b"))(100),
+  annotation_row    = annot_row,
+  annotation_col    = annot_col,
+  annotation_colors = c(annot_colors,
+                         list(TimePoint = c(T1 = "#2b8cbe", T2 = "#d7301f"))),
+  cluster_cols      = FALSE,     # keep T1 → T2 order
+  cluster_rows      = FALSE,     # keep class-sorted order (more interpretable)
+  show_rownames     = TRUE,
+  fontsize_row      = 5,
+  fontsize_col      = 13,
+  fontsize          = 10,
+  border_color      = NA,
+  gaps_row          = cumsum(table(hm_all$Class)),  # white gap between classes
+  main              = "Lipidomics — MCF7 (T1 vs T2)\nlog2(peak area), sorted by lipid class"
+)
+dev.off()
+cat("✓ Saved: heatmap_log2_abundance.png\n")
+
+# --------------------------------------------------------------------------
+# 3. HEATMAP B — log2 Fold Change (T2 vs T1), only lipids in BOTH samples
+# --------------------------------------------------------------------------
+# This is the most biologically informative view:
+# one column per lipid, colour = direction and magnitude of change
+
+hm_both <- data_wide %>%
+  filter(detected_in == "Both") %>%
+  arrange(Class, log2FC)
+
+fc_mat <- matrix(hm_both$log2FC, ncol = 1)
+rownames(fc_mat) <- hm_both$Lipid
+colnames(fc_mat) <- "log2FC (T2/T1)"
+
+annot_row_fc <- data.frame(
+  Class = hm_both$Class,
+  row.names = hm_both$Lipid
+)
+
+# Symmetric colour scale centred at 0
+fc_max <- max(abs(hm_both$log2FC), na.rm = TRUE)
+breaks_fc <- seq(-fc_max, fc_max, length.out = 101)
+
+png("heatmap_foldchange.png", width = 1000, height = 3000, res = 220)
+pheatmap(
+  fc_mat,
+  color             = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+  breaks            = breaks_fc,
+  annotation_row    = annot_row_fc,
+  annotation_colors = list(Class = cls_pal[names(cls_pal) %in% hm_both$Class]),
+  cluster_cols      = FALSE,
+  cluster_rows      = FALSE,     # class-sorted, then by FC within class
+  show_rownames     = TRUE,
+  show_colnames     = TRUE,
+  fontsize_row      = 5,
+  fontsize_col      = 12,
+  fontsize          = 10,
+  border_color      = "white",
+  gaps_row          = cumsum(table(hm_both$Class)),
+  main              = "Fold Change Heatmap\nMCF7 T2 vs T1\n(lipids in both timepoints)"
+)
+dev.off()
+cat("✓ Saved: heatmap_foldchange.png\n")
+
+# --------------------------------------------------------------------------
+# 4. HEATMAP C — Clustered heatmap (only lipids in BOTH, log2 values)
+# --------------------------------------------------------------------------
+# Clustering works properly here because lipids have different absolute
+# abundances — this reveals co-regulated lipid groups
+
+hm_both2 <- data_wide %>% filter(detected_in == "Both")
+mat_both <- as.matrix(hm_both2[, c("log2_T1", "log2_T2")])
+rownames(mat_both) <- hm_both2$Lipid
+colnames(mat_both) <- c("T1", "T2")
+
+annot_row_b <- data.frame(
+  Class = hm_both2$Class,
+  row.names = hm_both2$Lipid
+)
+
+png("heatmap_clustered_both.png", width = 1400, height = 2800, res = 220)
+pheatmap(
+  mat_both,
+  color             = colorRampPalette(c("#fff7ec","#fdd49e","#fdbb84",
+                                          "#fc8d59","#e34a33","#b30000"))(100),
+  annotation_row    = annot_row_b,
+  annotation_col    = data.frame(TimePoint = c("T1","T2"), row.names = c("T1","T2")),
+  annotation_colors = c(
+    list(Class     = cls_pal[names(cls_pal) %in% hm_both2$Class],
+         TimePoint = c(T1 = "#2b8cbe", T2 = "#d7301f"))
+  ),
+  cluster_cols      = FALSE,
+  cluster_rows      = TRUE,      # cluster lipids by abundance pattern
+  cutree_rows       = 3,         # split into 3 clusters
+  show_rownames     = TRUE,
+  fontsize_row      = 5.5,
+  fontsize_col      = 13,
+  border_color      = NA,
+  main              = "Clustered Heatmap — Lipids in Both Timepoints\nlog2(peak area)"
+)
+dev.off()
+cat("✓ Saved: heatmap_clustered_both.png\n")
+
+# --------------------------------------------------------------------------
+# 5. BONUS: Lipid class summary bar plot (mean log2FC per class)
+# --------------------------------------------------------------------------
+class_fc <- data_wide %>%
+  filter(detected_in == "Both") %>%
+  group_by(Class) %>%
   summarise(
-    MeanIntensity = mean(Intensity, na.rm = TRUE),
-    MeanArea      = mean(Area,      na.rm = TRUE),
-    MeanIDScore   = mean(IDScore,   na.rm = TRUE),
-    MeanRT        = mean(TopRT,     na.rm = TRUE),
-    MeanSNR       = mean(`S/N`,     na.rm = TRUE),
-    Count         = n(),
-    LipidClass    = first(LipidClass),
-    .groups = "drop"
-  )
- 
-cat(sprintf("\n%d unique lipid species after aggregation\n", nrow(assay_mat)))
- 
- 
-# ── 5. Quality filtering ─────────────────────────────────────
-# Keep lipids with IDScore > 0 and S/N > 1
-filtered <- assay_mat %>%
-  filter(MeanIDScore > 0, MeanSNR > 1)
- 
-cat(sprintf("%d lipids pass QC filter (IDScore > 0, S/N > 1)\n", nrow(filtered)))
- 
- 
-# ── 6. Log-transform intensities ─────────────────────────────
-filtered <- filtered %>%
-  mutate(
-    log2Intensity = log2(MeanIntensity + 1),
-    log2Area      = log2(MeanArea + 1)
-  )
- 
- 
-# ── 7. Lipid class summary ───────────────────────────────────
-class_summary <- filtered %>%
-  group_by(LipidClass) %>%
-  summarise(
-    n_species       = n(),
-    median_intensity = median(MeanIntensity),
-    median_area      = median(MeanArea),
-    median_IDScore   = median(MeanIDScore),
-    median_RT        = median(MeanRT),
+    n          = n(),
+    mean_log2FC = mean(log2FC),
+    se          = sd(log2FC) / sqrt(n()),
+    up          = sum(log2FC > 1),
+    down        = sum(log2FC < -1),
     .groups = "drop"
   ) %>%
-  arrange(desc(median_intensity))
+  arrange(mean_log2FC)
+
+p_bar <- ggplot(class_fc, aes(x = reorder(Class, mean_log2FC),
+                               y = mean_log2FC, fill = mean_log2FC)) +
+  geom_col(color = "white", width = 0.7) +
+  geom_errorbar(aes(ymin = mean_log2FC - se, ymax = mean_log2FC + se),
+                width = 0.3, color = "grey30") +
+  geom_hline(yintercept = 0, linewidth = 0.6) +
+  geom_text(aes(label = paste0("n=", n)),
+            hjust = ifelse(class_fc$mean_log2FC >= 0, -0.2, 1.2),
+            size = 3.2, color = "grey20") +
+  scale_fill_gradient2(low = "#2b8cbe", mid = "grey90", high = "#d7301f",
+                       midpoint = 0, guide = "none") +
+  coord_flip() +
+  labs(title    = "Mean log2 Fold Change per Lipid Class (T2 vs T1)",
+       subtitle = "Error bars = ±SE | n = lipids detected in both timepoints",
+       x = NULL, y = "Mean log2FC (T2/T1)") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+ggsave("barplot_class_FC.png", p_bar, width = 9, height = 6, dpi = 200)
+cat("✓ Saved: barplot_class_FC.png\n")
+
+cat("\n=== All heatmaps saved ===\n")
+cat("heatmap_log2_abundance.png  — all lipids, log2 area, class-sorted\n")
+cat("heatmap_foldchange.png      — lipids in both, single-column FC heatmap\n")
+cat("heatmap_clustered_both.png  — lipids in both, clustered by abundance\n")
+cat("barplot_class_FC.png        — mean FC per class summary\n")
+# =============================================================================
+# KEGG ANALYSIS + NETWORK ANALYSIS — MCF7 LIPIDOMICS
+# Continues from heatmap_corrected.R — run that script first OR
+# paste the data loading block below if running standalone
+# =============================================================================
  
-print(class_summary)
+library(readODS)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(igraph)
+library(ggraph)
+library(writexl)
  
+setwd("/home/mahe/lipidomics")
  
-# ── 8. Heatmap of lipid class × metric ───────────────────────
-# Build a matrix: rows = lipid classes, columns = metrics (z-scored)
-hm_mat <- class_summary %>%
-  column_to_rownames("LipidClass") %>%
-  select(n_species, median_intensity, median_area,
-         median_IDScore, median_RT) %>%
-  as.matrix()
+# =============================================================================
+# BLOCK 0: DATA — skip this if data_wide already exists from heatmap script
+# =============================================================================
  
-# Z-score each column across classes
-hm_scaled <- scale(hm_mat)
- 
-col_fun <- colorRamp2(
-  c(-2, 0, 2),
-  c("#185FA5", "white", "#993C1D")   # blue → white → coral
-)
- 
-png("heatmap_lipid_classes.png", width = 900, height = 700, res = 120)
-Heatmap(
-  hm_scaled,
-  name            = "z-score",
-  col             = col_fun,
-  row_names_gp    = gpar(fontsize = 11),
-  column_names_gp = gpar(fontsize = 11),
-  column_names_rot = 30,
-  cell_fun = function(j, i, x, y, width, height, fill) {
-    grid.text(sprintf("%.2f", hm_scaled[i, j]),
-              x, y, gp = gpar(fontsize = 9))
-  },
-  column_title    = "Lipid class profile heatmap (z-scored)",
-  column_title_gp = gpar(fontsize = 13, fontface = "bold"),
-  heatmap_legend_param = list(title = "z-score", direction = "horizontal")
-)
-dev.off()
-cat("Saved: heatmap_lipid_classes.png\n")
- 
- 
-# ── 9. Per-species heatmap (top 30 by intensity) ─────────────
-top30 <- filtered %>%
-  slice_max(order_by = MeanIntensity, n = 30)
- 
-sp_mat <- top30 %>%
-  select(log2Intensity, log2Area, MeanIDScore, MeanRT, MeanSNR) %>%
-  as.matrix()
-rownames(sp_mat) <- top30$LipidGroupKey
- 
-sp_scaled <- scale(sp_mat)
- 
-# Annotation bar: lipid class
-class_colors <- setNames(
-  colorRampPalette(brewer.pal(11, "Set3"))(length(unique(top30$LipidClass))),
-  unique(top30$LipidClass)
-)
-row_ann <- rowAnnotation(
-  Class = top30$LipidClass,
-  col   = list(Class = class_colors),
-  annotation_name_gp = gpar(fontsize = 10)
-)
- 
-png("heatmap_top30_species.png", width = 1000, height = 900, res = 120)
-Heatmap(
-  sp_scaled,
-  name            = "z-score",
-  col             = col_fun,
-  left_annotation = row_ann,
-  row_names_gp    = gpar(fontsize = 9),
-  column_names_gp = gpar(fontsize = 10),
-  column_names_rot = 30,
-  column_title    = "Top 30 lipid species (z-scored metrics)",
-  column_title_gp = gpar(fontsize = 13, fontface = "bold"),
-  row_dend_side   = "right",
-  clustering_distance_rows = "euclidean",
-  clustering_method_rows   = "ward.D2"
-)
-dev.off()
-cat("Saved: heatmap_top30_species.png\n")
- 
- 
-# ── 10. Network: co-elution network (shared RT window) ───────
-# Connect lipid species whose retention times are within 1.5 min
-rt_threshold <- 1.5
- 
-# Build edge list
-nodes <- filtered %>%
-  select(LipidGroupKey, LipidClass, log2Intensity, MeanRT, MeanIDScore)
- 
-n <- nrow(nodes)
-edges <- data.frame()
- 
-for (i in 1:(n - 1)) {
-  for (j in (i + 1):n) {
-    rt_diff <- abs(nodes$MeanRT[i] - nodes$MeanRT[j])
-    if (rt_diff <= rt_threshold) {
-      edges <- rbind(edges, data.frame(
-        from   = nodes$LipidGroupKey[i],
-        to     = nodes$LipidGroupKey[j],
-        weight = 1 - (rt_diff / rt_threshold)   # closer RT → stronger edge
-      ))
-    }
+if (!exists("data_wide")) {
+  
+  file_path <- "/home/mahe/lipidomics/lipidomics_data.ods"
+  s1 <- read_ods(file_path, sheet = "1 sample")
+  s2 <- read_ods(file_path, sheet = "2 sample")
+  colnames(s1) <- c("Lipid", "intensity_T1", "area_T1")
+  colnames(s2) <- c("Lipid", "intensity_T2", "area_T2")
+  
+  clean_lipid_name <- function(x) {
+    x <- sub("\\+H$", "", x);  x <- sub("\\+Na$", "", x)
+    x <- sub("-H$", "", x);    x <- sub("\\+NH4$", "", x)
+    x <- sub("\\+HCOO$", "", x); x <- sub("\\+CHO.*$", "", x)
+    x <- sub("\\+COOCH3.*$", "", x); x <- sub(":\\(s\\)$", "", x)
+    trimws(x)
   }
+  s1$Lipid <- clean_lipid_name(s1$Lipid)
+  s2$Lipid <- clean_lipid_name(s2$Lipid)
+  
+  data_wide <- full_join(
+    s1 %>% select(Lipid, T1 = area_T1),
+    s2 %>% select(Lipid, T2 = area_T2),
+    by = "Lipid"
+  ) %>%
+    group_by(Lipid) %>%
+    summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+  
+  data_wide[is.na(data_wide)] <- 0
+  data_wide <- data_wide %>%
+    mutate(
+      Class    = str_extract(Lipid, "^[A-Za-z]+"),
+      log2_T1  = log2(T1 + 1),
+      log2_T2  = log2(T2 + 1),
+      log2FC   = log2_T2 - log2_T1,
+      detected_in = case_when(
+        T1 > 0 & T2 > 0  ~ "Both",
+        T1 > 0 & T2 == 0 ~ "T1 only",
+        T1 == 0 & T2 > 0 ~ "T2 only",
+        TRUE              ~ "Neither"
+      )
+    )
+  cat("Data loaded:", nrow(data_wide), "lipids\n")
 }
  
-cat(sprintf("Network: %d nodes, %d edges\n", n, nrow(edges)))
+# =============================================================================
+# BLOCK 1: KEGG PATHWAY MAPPING
+# =============================================================================
+# KEGG does not have individual lipid species IDs (like genes have Entrez IDs)
+# so we map at the LIPID CLASS level — which is the standard approach for
+# lipidomics KEGG analysis (used in published MCF7 lipidomics studies)
+# Each class maps to a specific KEGG lipid metabolism pathway
+# =============================================================================
  
-g <- graph_from_data_frame(
-  d        = edges,
-  vertices = nodes %>% rename(name = LipidGroupKey),
-  directed = FALSE
+kegg_map <- data.frame(
+  Class = c(
+    # Glycerophospholipids — hsa00564
+    "PC","LPC","LPCO","LPCP",
+    "PE","LPE",
+    "PS","LPS",
+    "PI","LPI",
+    "PG","PGO","PGP",
+    "PA",
+    # Sphingolipids — hsa00600
+    "SM","Cer","SPH","HexCer","LacCer",
+    # Glycerolipids — hsa00561
+    "TG","DG","MG",
+    # Fatty acids — hsa01212
+    "FA","FAHFA","NA",
+    # Fatty acid degradation — hsa00071
+    "AcCa",
+    # Ether lipids — hsa00565
+    "PC O","PE O","LPC O","LPE O"
+  ),
+  KEGG_id = c(
+    rep("hsa00564", 14),
+    rep("hsa00600", 5),
+    rep("hsa00561", 3),
+    rep("hsa01212", 3),
+    "hsa00071",
+    rep("hsa00565", 4)
+  ),
+  KEGG_pathway = c(
+    rep("Glycerophospholipid metabolism", 14),
+    rep("Sphingolipid metabolism", 5),
+    rep("Glycerolipid metabolism", 3),
+    rep("Fatty acid metabolism", 3),
+    "Fatty acid degradation",
+    rep("Ether lipid metabolism", 4)
+  ),
+  stringsAsFactors = FALSE
 )
  
-# Node attributes — base R rescaling (avoids dependency on scales::rescale)
-rescale_range <- function(x, new_min = 3, new_max = 14) {
-  new_min + (x - min(x, na.rm = TRUE)) /
-    (max(x, na.rm = TRUE) - min(x, na.rm = TRUE)) * (new_max - new_min)
-}
-V(g)$size      <- rescale_range(V(g)$log2Intensity)
-V(g)$color_cls <- V(g)$LipidClass
+# --- Merge your lipids with KEGG map ---
+fc_kegg <- data_wide %>%
+  left_join(kegg_map, by = "Class")
  
-png("network_coelution.png", width = 1200, height = 1000, res = 120)
-set.seed(42)
-ggraph(g, layout = "fr") +                          # Fruchterman-Reingold
-  geom_edge_link(aes(alpha = weight), color = "gray70", width = 0.4) +
-  geom_node_point(aes(size = log2Intensity, color = LipidClass)) +
-  geom_node_text(
-    aes(label = ifelse(log2Intensity > quantile(log2Intensity, 0.75),
-                       name, "")),
-    size = 2.8, repel = TRUE, max.overlaps = 20
-  ) +
-  scale_size_continuous(range = c(2, 10), name = "log2 Intensity") +
-  scale_color_brewer(palette = "Set3", name = "Lipid class") +
-  scale_edge_alpha(range = c(0.1, 0.6), guide = "none") +
+# How many lipids mapped?
+cat("\nKEGG mapping summary:\n")
+cat("  Mapped:   ", sum(!is.na(fc_kegg$KEGG_pathway)), "lipids\n")
+cat("  Unmapped: ", sum( is.na(fc_kegg$KEGG_pathway)), "lipids\n")
+cat("  Unmapped classes:", paste(unique(fc_kegg$Class[is.na(fc_kegg$KEGG_pathway)]), collapse=", "), "\n\n")
+ 
+fc_kegg_mapped <- fc_kegg %>% filter(!is.na(KEGG_pathway))
+ 
+# =============================================================================
+# BLOCK 2: KEGG PATHWAY SUMMARY TABLE
+# =============================================================================
+ 
+pathway_summary <- fc_kegg_mapped %>%
+  group_by(KEGG_pathway, KEGG_id) %>%
+  summarise(
+    n_total      = n(),
+    n_both       = sum(detected_in == "Both"),
+    n_T1_only    = sum(detected_in == "T1 only"),
+    n_T2_only    = sum(detected_in == "T2 only"),
+    mean_log2FC  = round(mean(log2FC[detected_in == "Both"], na.rm = TRUE), 3),
+    up_in_T2     = sum(log2FC > 1,  na.rm = TRUE),
+    down_in_T2   = sum(log2FC < -1, na.rm = TRUE),
+    unchanged    = sum(abs(log2FC) <= 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(abs(mean_log2FC)))
+ 
+cat("KEGG Pathway Summary:\n")
+print(pathway_summary)
+ 
+# =============================================================================
+# BLOCK 3: KEGG VISUALISATIONS
+# =============================================================================
+ 
+# --- 3A: Bubble plot — main KEGG plot ---
+p_bubble <- ggplot(pathway_summary,
+                   aes(x    = mean_log2FC,
+                       y    = reorder(KEGG_pathway, mean_log2FC),
+                       size = n_total,
+                       fill = mean_log2FC)) +
+  geom_point(shape = 21, alpha = 0.9, color = "grey20") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dotted", color = "grey60") +
+  geom_text(aes(label = paste0(up_in_T2, "↑  ", down_in_T2, "↓")),
+            hjust = -0.25, size = 3.8, fontface = "bold") +
+  scale_fill_gradient2(low  = "#4575b4",
+                       mid  = "grey95",
+                       high = "#d73027",
+                       midpoint = 0,
+                       name = "Mean\nlog2FC") +
+  scale_size_continuous(range = c(5, 20), name = "Total\nlipids") +
+  scale_x_continuous(expand = expansion(mult = c(0.15, 0.35))) +
   labs(
-    title    = "Lipid co-elution network",
-    subtitle = paste0("Edges: RT difference ≤ ", rt_threshold, " min | ",
-                      "Node size: log2 intensity")
+    title    = "KEGG Lipid Pathway Activity — MCF7 (T2 vs T1)",
+    subtitle = "Bubble size = total lipids in pathway | Color = direction of change\nNumbers = lipids with |log2FC| > 1  (↑ up in T2, ↓ down in T2)",
+    x        = "Mean log2 Fold Change (T2/T1)",
+    y        = NULL
   ) +
-  theme_graph(base_family = "sans") +
+  theme_bw(base_size = 13) +
   theme(
-    plot.title    = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 11, color = "gray40"),
+    axis.text.y      = element_text(size = 12, face = "bold"),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "right",
+    panel.grid.major.y = element_line(color = "grey90")
+  )
+ 
+ggsave("KEGG_bubble_plot.png", p_bubble, width = 11, height = 6, dpi = 220)
+cat("✓ Saved: KEGG_bubble_plot.png\n")
+ 
+# --- 3B: Stacked bar — up/down/T1 only/T2 only per pathway ---
+bar_df <- fc_kegg_mapped %>%
+  mutate(category = case_when(
+    detected_in == "T2 only" ~ "New in T2",
+    detected_in == "T1 only" ~ "Lost in T2",
+    log2FC >  1              ~ "Up in T2 (>2×)",
+    log2FC < -1              ~ "Down in T2 (>2×)",
+    TRUE                     ~ "Unchanged"
+  )) %>%
+  count(KEGG_pathway, category)
+ 
+cat_colors <- c(
+  "Up in T2 (>2×)"   = "#d73027",
+  "New in T2"        = "#fc8d59",
+  "Unchanged"        = "grey75",
+  "Down in T2 (>2×)" = "#4575b4",
+  "Lost in T2"       = "#91bfdb"
+)
+ 
+p_bar <- ggplot(bar_df,
+                aes(x    = reorder(KEGG_pathway, n, sum),
+                    y    = n,
+                    fill = category)) +
+  geom_col(position = "stack", color = "white", width = 0.65) +
+  geom_text(aes(label = n),
+            position = position_stack(vjust = 0.5),
+            size = 3.2, color = "white", fontface = "bold") +
+  scale_fill_manual(values = cat_colors, name = NULL) +
+  coord_flip() +
+  labs(
+    title    = "Lipid Changes per KEGG Pathway — MCF7 (T2 vs T1)",
+    subtitle = "New/Lost = detected in only one timepoint",
+    x        = NULL,
+    y        = "Number of lipids"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.y     = element_text(size = 11, face = "bold"),
+    legend.position = "bottom",
+    plot.title      = element_text(face = "bold")
+  )
+ 
+ggsave("KEGG_stacked_bar.png", p_bar, width = 11, height = 6, dpi = 220)
+cat("✓ Saved: KEGG_stacked_bar.png\n")
+ 
+# --- 3C: Dot plot per lipid class within each pathway ---
+class_fc_summary <- fc_kegg_mapped %>%
+  filter(detected_in == "Both") %>%
+  group_by(KEGG_pathway, Class) %>%
+  summarise(
+    n           = n(),
+    mean_log2FC = mean(log2FC, na.rm = TRUE),
+    .groups = "drop"
+  )
+ 
+p_dot <- ggplot(class_fc_summary,
+                aes(x = mean_log2FC, y = Class, size = n, color = mean_log2FC)) +
+  geom_point(alpha = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  scale_color_gradient2(low = "#4575b4", mid = "grey80", high = "#d73027",
+                        midpoint = 0, guide = "none") +
+  scale_size_continuous(range = c(3, 12), name = "# lipids") +
+  facet_wrap(~ KEGG_pathway, scales = "free_y", ncol = 1) +
+  labs(
+    title    = "Lipid Class FC within Each KEGG Pathway",
+    subtitle = "Mean log2FC of lipids detected in both timepoints",
+    x        = "Mean log2 Fold Change (T2/T1)",
+    y        = NULL
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    strip.background = element_rect(fill = "#2b2b2b"),
+    strip.text       = element_text(color = "white", face = "bold", size = 10),
+    plot.title       = element_text(face = "bold")
+  )
+ 
+ggsave("KEGG_class_dotplot.png", p_dot, width = 10, height = 14, dpi = 220)
+cat("✓ Saved: KEGG_class_dotplot.png\n\n")
+lipid_nodes <- data_wide %>%
+  transmute(
+    name       = Lipid,
+    level      = "Lipid",
+    Class      = Class,
+    log2FC     = log2FC,
+    abundance  = (log2_T1 + log2_T2) / 2,
+    detected   = detected_in
+  )
+ 
+class_nodes <- fc_kegg_mapped %>%
+  group_by(Class) %>%
+  summarise(
+    log2FC    = mean(log2FC[detected_in == "Both"], na.rm = TRUE),
+    abundance = mean((log2_T1 + log2_T2) / 2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  transmute(
+    name      = Class,
+    level     = "Class",
+    Class     = Class,
+    log2FC    = log2FC,
+    abundance = abundance,
+    detected  = "Both"
+  )
+ 
+pathway_nodes <- pathway_summary %>%
+  transmute(
+    name      = KEGG_pathway,
+    level     = "Pathway",
+    Class     = "Pathway",
+    log2FC    = mean_log2FC,
+    abundance = NA_real_,
+    detected  = "Both"
+  )
+ 
+all_nodes <- bind_rows(lipid_nodes, class_nodes, pathway_nodes) %>%
+  distinct(name, .keep_all = TRUE)
+ 
+# --- 4B: Build edge table ---
+# Lipid → Class edges
+edges_lc <- data_wide %>%
+  transmute(from = Lipid, to = Class, weight = 1, edge_type = "Lipid → Class")
+ 
+# Class → Pathway edges (weight = number of lipids in that class for that pathway)
+edges_cp <- fc_kegg_mapped %>%
+  count(Class, KEGG_pathway, name = "weight") %>%
+  transmute(from = Class, to = KEGG_pathway, weight = weight,
+            edge_type = "Class → Pathway")
+ 
+all_edges <- bind_rows(edges_lc, edges_cp) %>%
+  filter(from %in% all_nodes$name, to %in% all_nodes$name)
+ 
+# --- 4C: igraph object ---
+g <- graph_from_data_frame(all_edges, vertices = all_nodes, directed = TRUE)
+ 
+V(g)$level     <- all_nodes$level[match(V(g)$name, all_nodes$name)]
+V(g)$log2FC    <- all_nodes$log2FC[match(V(g)$name, all_nodes$name)]
+V(g)$abundance <- all_nodes$abundance[match(V(g)$name, all_nodes$name)]
+E(g)$edge_type <- all_edges$edge_type
+E(g)$weight    <- all_edges$weight
+ 
+cat("Network: ", vcount(g), "nodes |", ecount(g), "edges\n")
+ 
+# --- 4D: NETWORK PLOT 1 — Full hierarchical network (Lipid → Class → Pathway) ---
+set.seed(123)
+png("network_full.png", width = 3000, height = 2600, res = 230)
+ggraph(g, layout = "fr") +
+  # edges
+  geom_edge_link(
+    aes(color = edge_type, width = log1p(weight)),
+    alpha = 0.45,
+    arrow = arrow(length = unit(2, "mm"), type = "closed"),
+    end_cap = circle(2.5, "mm")
+  ) +
+  # lipid nodes
+  geom_node_point(
+    aes(fill = log2FC, size = ifelse(is.na(abundance), 3, abundance)),
+    shape = 21, color = "grey30", stroke = 0.3,
+    data = function(x) filter(x, level == "Lipid")
+  ) +
+  # class nodes
+  geom_node_point(
+    aes(fill = log2FC),
+    shape = 23, size = 7, color = "grey10", stroke = 0.8,
+    data = function(x) filter(x, level == "Class")
+  ) +
+  # pathway nodes
+  geom_node_point(
+    aes(fill = log2FC),
+    shape = 22, size = 12, color = "grey10", stroke = 1,
+    data = function(x) filter(x, level == "Pathway")
+  ) +
+  # class labels
+  geom_node_label(
+    aes(label = name),
+    repel = TRUE, size = 3.2, fontface = "bold",
+    label.padding = unit(0.2, "lines"), label.size = 0.3,
+    data = function(x) filter(x, level == "Class")
+  ) +
+  # pathway labels
+  geom_node_label(
+    aes(label = str_wrap(name, 20)),
+    repel = TRUE, size = 3.5, fontface = "bold",
+    fill = "grey10", color = "white",
+    label.padding = unit(0.3, "lines"),
+    data = function(x) filter(x, level == "Pathway")
+  ) +
+  # lipid labels — only for top changed ones
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE, size = 1.8, color = "grey20",
+    data = function(x) filter(x, level == "Lipid", abs(log2FC) > 2)
+  ) +
+  scale_fill_gradient2(
+    low = "#4575b4", mid = "lightyellow", high = "#d73027",
+    midpoint = 0, na.value = "grey80",
+    name = "log2FC\n(T2/T1)"
+  ) +
+  scale_size_continuous(range = c(2, 8), name = "Mean\nlog2 abundance") +
+  scale_edge_color_manual(
+    values = c("Lipid → Class"   = "#bdbdbd",
+               "Class → Pathway" = "#252525"),
+    name = "Edge type"
+  ) +
+  scale_edge_width_continuous(range = c(0.3, 2.5), guide = "none") +
+  labs(
+    title    = "Lipid Network — MCF7 (T1 vs T2)",
+    subtitle = "Circle = lipid species | Diamond = lipid class | Square = KEGG pathway\nNode color: blue = decreased in T2, red = increased in T2"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 15),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey40"),
     legend.position = "right"
   )
 dev.off()
-cat("Saved: network_coelution.png\n")
+cat("✓ Saved: network_full.png\n")
+# --- 4E: NETWORK PLOT 2 — Class → Pathway only (cleaner summary network) ---
+g_cp <- induced_subgraph(g, V(g)$level %in% c("Class", "Pathway"))
  
- 
-# ── 11. Network: lipid class connectivity ────────────────────
-# Aggregate to class level and connect classes that share co-eluting species
-class_edges <- edges %>%
-  left_join(nodes %>% select(LipidGroupKey, LipidClass),
-            by = c("from" = "LipidGroupKey")) %>%
-  rename(class_from = LipidClass) %>%
-  left_join(nodes %>% select(LipidGroupKey, LipidClass),
-            by = c("to"   = "LipidGroupKey")) %>%
-  rename(class_to = LipidClass) %>%
-  filter(class_from != class_to) %>%
-  group_by(class_from, class_to) %>%
-  summarise(n_connections = n(), .groups = "drop")
- 
-class_nodes <- class_summary %>%
-  select(LipidClass, n_species, median_intensity)
- 
-g_class <- graph_from_data_frame(
-  d        = class_edges %>% rename(from = class_from, to = class_to),
-  vertices = class_nodes %>% rename(name = LipidClass),
+set.seed(42)
+png("network_class_pathway.png", width = 2000, height = 1600, res = 220)
+ggraph(g_cp, layout = "fr") +
+  geom_edge_link(
+    aes(width = weight, color = weight),
+    alpha = 0.7,
+    arrow = arrow(length = unit(3, "mm"), type = "closed"),
+    end_cap = circle(5, "mm")
+  ) +
+  geom_node_point(
+    aes(fill = log2FC, shape = level),
+    size = 10, color = "grey20", stroke = 1
+  ) +
+  geom_node_label(
+    aes(label = name, fontface = ifelse(level == "Pathway", "bold", "plain")),
+    repel = TRUE, size = 3.5,
+    label.padding = unit(0.25, "lines")
+  ) +
+  scale_fill_gradient2(
+    low = "#4575b4", mid = "lightyellow", high = "#d73027",
+    midpoint = 0, na.value = "grey80",
+    name = "Mean\nlog2FC"
+  ) +
+  scale_shape_manual(
+    values = c("Class" = 23, "Pathway" = 22),
+    name = "Node type"
+  ) +
+  scale_edge_width_continuous(range = c(0.8, 5), name = "# Lipids") +
+  scale_edge_color_gradient(low = "grey70", high = "#252525", name = "# Lipids") +
+  labs(
+    title    = "Class → Pathway Network — MCF7 Lipidomics",
+    subtitle = "Diamond = lipid class | Square = KEGG pathway\nEdge width = number of lipids connecting class to pathway"
+  ) +
+  theme_void(base_size = 13) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+dev.off()
+cat("✓ Saved: network_class_pathway.png\n")
+hm_both <- data_wide %>% filter(detected_in == "Both")
+
+nodes_co <- hm_both %>%
+  transmute(
+    name      = trimws(Lipid),
+    Class     = trimws(Class),
+    log2FC    = log2FC,
+    abundance = (log2_T1 + log2_T2) / 2
+  ) %>%
+  distinct(name, .keep_all = TRUE) %>%
+  as.data.frame()
+
+rownames(nodes_co) <- NULL   # reset rownames to clean integers
+
+# Build edges using integer indices — avoids all name-matching issues
+class_groups <- split(seq_len(nrow(nodes_co)), nodes_co$Class)
+
+edge_indices <- do.call(rbind, lapply(class_groups, function(idx) {
+  if (length(idx) < 2) return(NULL)
+  pairs <- combn(idx, 2)
+  data.frame(from = pairs[1,], to = pairs[2,])
+}))
+
+# Build graph from integer indices then assign names
+g_co <- graph_from_data_frame(
+  d        = edge_indices,
+  vertices = data.frame(name = seq_len(nrow(nodes_co))),
   directed = FALSE
 )
- 
-png("network_lipid_classes.png", width = 900, height = 800, res = 120)
-set.seed(7)
-ggraph(g_class, layout = "circle") +
-  geom_edge_link(aes(width = n_connections, alpha = n_connections),
-                 color = "#534AB7") +
-  geom_node_point(aes(size = n_species, color = name)) +
-  geom_node_label(aes(label = name), repel = TRUE,
-                  size = 3.5, fontface = "bold",
-                  label.padding = unit(0.2, "lines")) +
-  scale_size_continuous(range = c(5, 18), name = "# species") +
-  scale_edge_width_continuous(range = c(0.5, 4), name = "# co-elutions") +
-  scale_edge_alpha_continuous(range = c(0.2, 0.8), guide = "none") +
-  scale_color_brewer(palette = "Set3", guide = "none") +
-  labs(
-    title    = "Lipid class co-elution network",
-    subtitle = "Edge width = number of co-eluting species pairs between classes"
+
+# Assign node attributes manually
+V(g_co)$name      <- nodes_co$name
+V(g_co)$Class     <- nodes_co$Class
+V(g_co)$log2FC    <- nodes_co$log2FC
+V(g_co)$abundance <- nodes_co$abundance
+
+g_co <- simplify(g_co)
+g_co <- induced_subgraph(g_co, degree(g_co) > 0)
+
+cat("Network built successfully:", vcount(g_co), "nodes,", ecount(g_co), "edges\n")
+# --- PLOT: Co-occurrence network ---
+set.seed(99)
+png("/home/mahe/lipidomics/network_cooccurrence.png", width = 2400, height = 2200, res = 220)
+ggraph(g_co, layout = "fr") +
+  geom_edge_link(alpha = 0.15, color = "grey60") +
+  geom_node_point(
+    aes(fill = log2FC, size = abundance),
+    shape = 21, color = "grey20", stroke = 0.4
   ) +
-  theme_graph(base_family = "sans") +
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE, size = 2, color = "grey10",
+    data = function(x) filter(x, abs(log2FC) > 1.5 | abundance > 15)
+  ) +
+  scale_fill_gradient2(
+    low = "#4575b4", mid = "lightyellow", high = "#d73027",
+    midpoint = 0, name = "log2FC\n(T2/T1)"
+  ) +
+  scale_size_continuous(range = c(2.5, 10), name = "Mean\nlog2 abundance") +
+  labs(
+    title    = "Lipid Co-occurrence Network — MCF7",
+    subtitle = "Edges connect lipids of same class | Node color = log2FC (T2/T1)\nLabels: |log2FC| > 1.5 or high abundance"
+  ) +
+  theme_void(base_size = 12) +
   theme(
-    plot.title    = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 11, color = "gray40")
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 9, color = "grey40"),
+    legend.position = "right"
   )
 dev.off()
-cat("Saved: network_lipid_classes.png\n")
- 
- 
-# ── 12. Bubble / scatter plot (RT vs Intensity) ──────────────
-png("bubble_rt_intensity.png", width = 1000, height = 700, res = 120)
-ggplot(filtered, aes(x = MeanRT, y = log2Intensity,
-                     size = Count, color = LipidClass)) +
-  geom_point(alpha = 0.75) +
+cat("✓ Saved: network_cooccurrence.png\n")
+
+# --- Network statistics ---
+net_stats <- data.frame(
+  Lipid       = V(g_co)$name,
+  Class       = V(g_co)$Class,
+  log2FC      = round(V(g_co)$log2FC, 3),
+  abundance   = round(V(g_co)$abundance, 2),
+  degree      = degree(g_co),
+  betweenness = round(betweenness(g_co, normalized = TRUE), 4),
+  closeness   = round(closeness(g_co, normalized = TRUE), 4)
+) %>%
+  arrange(desc(betweenness))
+
+cat("\nTop 15 hub lipids by betweenness centrality:\n")
+print(head(net_stats, 15))
+
+# --- Save all results to Excel ---
+write_xlsx(
+  list(
+    KEGG_pathway_summary = as.data.frame(pathway_summary),
+    KEGG_lipid_mapping   = as.data.frame(fc_kegg_mapped %>%
+                             select(Lipid, Class, KEGG_pathway, KEGG_id,
+                                    log2FC, detected_in)),
+    network_statistics   = as.data.frame(net_stats),
+    unmapped_lipids      = as.data.frame(fc_kegg %>%
+                             filter(is.na(KEGG_pathway)) %>%
+                             select(Lipid, Class, log2FC, detected_in))
+  ),
+  "/home/mahe/lipidomics/KEGG_network_results.xlsx"
+)
+cat("✓ Saved: KEGG_network_results.xlsx\n")
+
+cat("\n========== ALL DONE ==========\n")
+cat("Check /home/mahe/lipidomics/ for all output files\n")
+
+# =============================================================================
+# VISUALISATIONS FROM KEGG_network_results.xlsx
+# =============================================================================
+
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(ggrepel)
+library(RColorBrewer)
+library(igraph)
+library(ggraph)
+library(stringr)
+
+setwd("/home/mahe/lipidomics")
+
+# Load all sheets
+pathway_sum  <- read_xlsx("KEGG_network_results.xlsx", sheet = "KEGG_pathway_summary")
+lipid_kegg   <- read_xlsx("KEGG_network_results.xlsx", sheet = "KEGG_lipid_mapping")
+net_stats    <- read_xlsx("KEGG_network_results.xlsx", sheet = "network_statistics")
+unmapped     <- read_xlsx("KEGG_network_results.xlsx", sheet = "unmapped_lipids")
+
+# =============================================================================
+# PLOT 1: KEGG Pathway Summary — Lollipop chart
+# =============================================================================
+p1 <- ggplot(pathway_sum,
+             aes(x = mean_log2FC,
+                 y = reorder(KEGG_pathway, mean_log2FC))) +
+  geom_segment(aes(x = 0, xend = mean_log2FC,
+                   yend = reorder(KEGG_pathway, mean_log2FC),
+                   color = mean_log2FC),
+               linewidth = 1.5) +
+  geom_point(aes(size = n_total, fill = mean_log2FC),
+             shape = 21, color = "grey20") +
+  geom_text(aes(label = paste0("n=", n_total,
+                               "  ↑", up_in_T2,
+                               " ↓", down_in_T2)),
+            hjust = ifelse(pathway_sum$mean_log2FC >= 0, -0.1, 1.1),
+            size = 3.5, color = "grey20") +
+  geom_vline(xintercept = 0, linewidth = 0.6, linetype = "dashed") +
+  scale_fill_gradient2(low="#4575b4", mid="grey95", high="#d73027",
+                       midpoint=0, guide="none") +
+  scale_color_gradient2(low="#4575b4", mid="grey95", high="#d73027",
+                        midpoint=0, guide="none") +
+  scale_size_continuous(range = c(5, 16), name = "Total lipids") +
+  scale_x_continuous(expand = expansion(mult = c(0.25, 0.35))) +
+  labs(title    = "KEGG Pathway Activity — MCF7 (T2 vs T1)",
+       subtitle = "n = total lipids | ↑↓ = lipids with |log2FC| > 1",
+       x = "Mean log2 Fold Change (T2/T1)", y = NULL) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.y   = element_text(size = 12, face = "bold"),
+        plot.title     = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+ggsave("viz_kegg_lollipop.png", p1, width = 11, height = 5, dpi = 220)
+cat("✓ viz_kegg_lollipop.png\n")
+
+# =============================================================================
+# PLOT 2: Per-lipid FC dotplot inside each KEGG pathway
+# =============================================================================
+lipid_kegg <- lipid_kegg %>%
+  mutate(direction = case_when(
+    log2FC >  1 ~ "Up in T2",
+    log2FC < -1 ~ "Down in T2",
+    TRUE         ~ "Unchanged"
+  ))
+
+p2 <- ggplot(lipid_kegg,
+             aes(x = log2FC,
+                 y = reorder(Lipid, log2FC),
+                 fill = direction)) +
+  geom_col(width = 0.7, color = NA) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linewidth = 0.5) +
+  scale_fill_manual(values = c("Up in T2"   = "#d73027",
+                                "Down in T2" = "#4575b4",
+                                "Unchanged"  = "grey70"),
+                    name = NULL) +
+  facet_wrap(~ KEGG_pathway, scales = "free_y", ncol = 2) +
+  labs(title    = "Individual Lipid Fold Changes per KEGG Pathway",
+       subtitle = "MCF7 T2 vs T1 | Dashed lines: |log2FC| = 1",
+       x = "log2 Fold Change (T2/T1)", y = NULL) +
+  theme_bw(base_size = 10) +
+  theme(strip.background = element_rect(fill = "#2b2b2b"),
+        strip.text        = element_text(color="white", face="bold", size=9),
+        axis.text.y       = element_text(size = 6),
+        legend.position   = "bottom",
+        plot.title        = element_text(face = "bold"))
+ggsave("viz_lipid_FC_per_pathway.png", p2, width = 14, height = 16, dpi = 220)
+cat("✓ viz_lipid_FC_per_pathway.png\n")
+
+# =============================================================================
+# PLOT 3: Network statistics — Betweenness vs log2FC scatter
+# =============================================================================
+p3 <- ggplot(net_stats,
+             aes(x = log2FC, y = betweenness,
+                 size = abundance, fill = log2FC)) +
+  geom_point(shape = 21, color = "grey30", alpha = 0.85) +
   geom_text_repel(
-    data = filtered %>% slice_max(log2Intensity, n = 15),
-    aes(label = LipidGroupKey),
-    size = 2.8, max.overlaps = 15, box.padding = 0.4
+    aes(label = Lipid),
+    data  = net_stats %>% filter(betweenness > quantile(betweenness, 0.85) |
+                                   abs(log2FC) > 2),
+    size  = 2.8, max.overlaps = 20, color = "grey10"
   ) +
-  scale_size_continuous(range = c(3, 12), name = "Detection count") +
-  scale_color_brewer(palette = "Set3", name = "Lipid class") +
-  labs(
-    x        = "Mean retention time (min)",
-    y        = "log2 mean intensity",
-    title    = "Lipid species: retention time vs intensity",
-    subtitle = "Bubble size = detection count; top 15 labelled"
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    plot.title    = element_text(face = "bold"),
-    panel.grid.minor = element_blank()
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey60") +
+  geom_hline(yintercept = median(net_stats$betweenness),
+             linetype = "dashed", color = "grey60") +
+  scale_fill_gradient2(low="#4575b4", mid="lightyellow", high="#d73027",
+                       midpoint=0, name="log2FC") +
+  scale_size_continuous(range = c(2, 10), name="Abundance") +
+  facet_wrap(~ Class, scales = "free") +
+  labs(title    = "Network Hub Analysis — MCF7 Lipidomics",
+       subtitle = "X = fold change | Y = betweenness centrality (network importance)\nLabels: top 15% betweenness or |log2FC| > 2",
+       x = "log2 Fold Change (T2/T1)",
+       y = "Betweenness Centrality") +
+  theme_bw(base_size = 11) +
+  theme(strip.background = element_rect(fill = "grey20"),
+        strip.text        = element_text(color="white", face="bold"),
+        plot.title        = element_text(face="bold"))
+ggsave("viz_network_hub_scatter.png", p3, width = 14, height = 12, dpi = 220)
+cat("✓ viz_network_hub_scatter.png\n")
+
+# =============================================================================
+# PLOT 4: Top hub lipids — horizontal bar (betweenness centrality)
+# =============================================================================
+top_hubs <- net_stats %>%
+  arrange(desc(betweenness)) %>%
+  head(20) %>%
+  mutate(direction = case_when(
+    log2FC >  1 ~ "Up in T2",
+    log2FC < -1 ~ "Down in T2",
+    TRUE         ~ "Unchanged"
+  ))
+
+p4 <- ggplot(top_hubs,
+             aes(x = betweenness,
+                 y = reorder(Lipid, betweenness),
+                 fill = log2FC)) +
+  geom_col(color = "grey30", width = 0.7) +
+  geom_text(aes(label = paste0("FC=", round(log2FC,2), " | ", Class)),
+            hjust = -0.05, size = 3.2, color = "grey20") +
+  scale_fill_gradient2(low="#4575b4", mid="grey90", high="#d73027",
+                       midpoint=0, name="log2FC\n(T2/T1)") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.4))) +
+  labs(title    = "Top 20 Hub Lipids — Network Betweenness Centrality",
+       subtitle = "Higher betweenness = more central to lipid co-regulation network",
+       x = "Betweenness Centrality (normalized)", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.y = element_text(size = 10, face = "bold"),
+        plot.title   = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+ggsave("viz_top_hubs_bar.png", p4, width = 11, height = 8, dpi = 220)
+cat("✓ viz_top_hubs_bar.png\n")
+
+# =============================================================================
+# PLOT 5: Class-level summary tile / matrix plot
+# =============================================================================
+class_summary <- lipid_kegg %>%
+  group_by(Class, KEGG_pathway) %>%
+  summarise(
+    n           = n(),
+    mean_log2FC = mean(log2FC, na.rm = TRUE),
+    .groups = "drop"
   )
-dev.off()
-cat("Saved: bubble_rt_intensity.png\n")
- 
- 
-# ── 13. Export cleaned data ───────────────────────────────────
-write_csv(filtered,       "lipids_filtered_aggregated.csv")
-write_csv(class_summary,  "lipid_class_summary.csv")
- 
-cat("\n✓ Analysis complete. Files saved:\n")
-cat("  heatmap_lipid_classes.png\n")
-cat("  heatmap_top30_species.png\n")
-cat("  network_coelution.png\n")
-cat("  network_lipid_classes.png\n")
-cat("  bubble_rt_intensity.png\n")
-cat("  lipids_filtered_aggregated.csv\n")
-cat("  lipid_class_summary.csv\n")
+
+p5 <- ggplot(class_summary,
+             aes(x = KEGG_pathway,
+                 y = Class,
+                 fill = mean_log2FC,
+                 size = n)) +
+  geom_point(shape = 21, color = "grey20") +
+  scale_fill_gradient2(low="#4575b4", mid="lightyellow", high="#d73027",
+                       midpoint=0, name="Mean\nlog2FC") +
+  scale_size_continuous(range = c(3, 14), name="# Lipids") +
+  scale_x_discrete(labels = function(x) str_wrap(x, 18)) +
+  labs(title    = "Lipid Class × KEGG Pathway Matrix — MCF7",
+       subtitle = "Bubble size = number of lipids | Color = mean fold change (T2/T1)",
+       x = NULL, y = "Lipid Class") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x  = element_text(angle = 30, hjust = 1, size = 10),
+        axis.text.y  = element_text(size = 11, face = "bold"),
+        plot.title   = element_text(face = "bold"),
+        panel.grid   = element_line(color = "grey90"))
+ggsave("viz_class_pathway_matrix.png", p5, width = 12, height = 8, dpi = 220)
+cat("✓ viz_class_pathway_matrix.png\n")
+
+# =============================================================================
+# PLOT 6: Detection status summary — what changed between T1 and T2
+# =============================================================================
+detect_sum <- lipid_kegg %>%
+  count(KEGG_pathway, detected_in) %>%
+  mutate(detected_in = factor(detected_in,
+                               levels = c("T1 only","Both","T2 only")))
+
+p6 <- ggplot(detect_sum,
+             aes(x = n,
+                 y = reorder(KEGG_pathway, n, sum),
+                 fill = detected_in)) +
+  geom_col(position = "stack", color = "white", width = 0.65) +
+  geom_text(aes(label = n),
+            position = position_stack(vjust = 0.5),
+            size = 3.5, color = "white", fontface = "bold") +
+  scale_fill_manual(values = c("T1 only" = "#2b8cbe",
+                                "Both"    = "#2ca25f",
+                                "T2 only" = "#d7301f"),
+                    name = "Detected in") +
+  labs(title    = "Lipid Detection Status per KEGG Pathway",
+       subtitle = "Green = present in both timepoints | Blue = T1 only | Red = T2 only",
+       x = "Number of lipids", y = NULL) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.y      = element_text(size = 11, face = "bold"),
+        legend.position  = "bottom",
+        plot.title       = element_text(face = "bold"),
+        panel.grid.major.y = element_blank())
+ggsave("viz_detection_status.png", p6, width = 10, height = 5, dpi = 220)
+cat("✓ viz_detection_status.png\n")
+
+cat("\n===== ALL VISUALISATIONS COMPLETE =====\n")
+cat("viz_kegg_lollipop.png\n")
+cat("viz_lipid_FC_per_pathway.png\n")
+cat("viz_network_hub_scatter.png\n")
+cat("viz_top_hubs_bar.png\n")
+cat("viz_class_pathway_matrix.png\n")
+cat("viz_detection_status.png\n")
